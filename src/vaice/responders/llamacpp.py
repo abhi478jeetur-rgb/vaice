@@ -373,6 +373,8 @@ def _converse(
                         session.send({"type": "conversation.item.create", "item": {
                             "type": "function_call_output", "call_id": call.call_id, "output": output}})
                     calls = []
+                    if stop():  # don't ask the model to continue after the user or the app stopped
+                        raise _Stopped
                     # after the first round, let the model chain; at the cap, force the answer
                     _create_response(session, "auto" if rounds < MAX_TOOL_ROUNDS else "none")
     except _Stopped:
@@ -425,7 +427,7 @@ def write_capable_tools(url: str, timeout: float = CHECK_TIMEOUT) -> list[str]:
     return [str(entry.get("tool")) for entry in r.json() if (entry.get("permissions") or {}).get("write")]
 
 
-def execute_tool(url: str, timeout: float) -> Callable[[str, str], str]:
+def execute_tool(url: str, timeout: float, stop: Callable[[], bool] | None = None) -> Callable[[str, str], str]:
     """What a `function_call` is worth: `POST {url}/tools` with `{"tool": name, "params": {...}}`.
 
     The server reads the tool's parameters from `params` (a JSON object), not from the model's
@@ -435,6 +437,12 @@ def execute_tool(url: str, timeout: float) -> Callable[[str, str], str]:
     must be spoken too, not raised: this runs on the session thread, and the result (not the
     traceback) is what the model sees and what `app.py` shows in the UI. A closure over `url` and
     `timeout`, mirroring how `_open` builds the websocket.
+
+    The request itself is not cancelled (the HTTP library has no safe way to interrupt a synchronous
+    call), but the caller does not have to wait for it: the POST runs on a daemon thread and this
+    stops waiting when `stop` (when given) fires or `timeout` passes — the reply gives up promptly
+    and the result is discarded. The thread ends when the server answers or `timeout` expires; it
+    is a daemon, so it cannot keep the process alive.
     """
 
     def call(name: str, arguments: str) -> str:
@@ -444,13 +452,33 @@ def execute_tool(url: str, timeout: float) -> Callable[[str, str], str]:
             return f"tool {name} failed: arguments are not JSON: {arguments!r}"
         if not isinstance(params, dict):
             return f"tool {name} failed: arguments are not a JSON object: {arguments!r}"
-        try:
-            r = requests.post(f"{url}/tools", json={"tool": name, "params": params}, timeout=timeout)
-        except requests.RequestException as exc:
-            return f"tool {name} failed: {exc}"
-        if not r.ok:
-            return f"tool {name} failed: HTTP {r.status_code}: {r.text[:200]}"
-        return str(r.text)
+        if stop is not None and stop():
+            return f"tool {name} aborted: the reply was stopped"
+        # requests' timeout applies per socket operation and does not help here; instead, the call
+        # runs on a daemon thread and this polls it — a healthy slow tool is never destroyed, and
+        # the timeout bounds the caller either way
+        result: dict[str, str] = {}
+
+        def work() -> None:
+            try:
+                r = requests.post(f"{url}/tools", json={"tool": name, "params": params}, timeout=timeout)
+                if not r.ok:
+                    result["out"] = f"tool {name} failed: HTTP {r.status_code}: {str(r.text)[:200]}"
+                    return
+                result["out"] = str(r.text)
+            except Exception as exc:  # noqa: BLE001 - a tool failure must be spoken, not raised; the thread must never die silently
+                result["out"] = f"tool {name} failed: {exc}"
+
+        worker = threading.Thread(target=work, name=f"vaice-tool-{name}", daemon=True)
+        worker.start()
+        deadline = time.monotonic() + timeout
+        while worker.is_alive():
+            if stop is not None and stop():
+                return f"tool {name} aborted: the reply was stopped"
+            if time.monotonic() > deadline:
+                return f"tool {name} failed: timed out after {timeout:g}s"
+            worker.join(POLL_SECONDS)
+        return result.get("out", f"tool {name} failed: the request thread died")
 
     return call
 
@@ -568,10 +596,9 @@ class LlamaCppResponder:
         # The server's built-in tools (fetch_tools), declared in session.update and executed through
         # the server's /tools endpoint; None = no tools, the session.update of before. The server
         # decides which tools those are (--tools) and refuses to execute anything it did not
-        # advertise, so the executor passes every call through.
+        # advertise, so the executor passes every call through. The default executor is built per
+        # reply (respond()), because it carries that reply's stop signal.
         self._tools = tools or None
-        if self._tools and executor is None:
-            executor = execute_tool(url, timeout)
         self._executor = executor
         # Switchable so the live A/B can isolate the clock line's effect
         self._clock = clock
@@ -586,11 +613,17 @@ class LlamaCppResponder:
         ).start()
         chunks: queue.Queue = queue.Queue()
         cancelled = threading.Event()
+        # The default executor is per reply: it carries this reply's stop signal, so an in-flight
+        # tool call gives up when the user barges in or the app stops
+        executor = self._executor
+        if executor is None and self._tools:
+            executor = execute_tool(self._url, self._timeout,
+                                    stop=lambda: cancelled.is_set() or lifecycle.stopping.is_set())
         context = _context_lines(clock=self._clock)
         threading.Thread(
             target=_converse,
             args=(self._url, self._timeout, _instructions(self._prompt, history, context), audio, chunks, cancelled,
-                  self._max_output_tokens, self._tools, self._executor, turn),
+                  self._max_output_tokens, self._tools, executor, turn),
             name="vaice-llamacpp",
             daemon=True,
         ).start()

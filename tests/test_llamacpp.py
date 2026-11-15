@@ -595,6 +595,65 @@ def test_the_default_executor_posts_the_tool_to_the_server(monkeypatch):
     assert "HTTP 500" in llamacpp.execute_tool("http://h:1", 7.0)("get_info", "{}")
 
 
+def test_a_tool_call_does_not_start_when_the_reply_was_already_stopped(monkeypatch):
+    def unexpected(*a, **k):
+        raise AssertionError("a stopped reply must not reach the server")
+
+    monkeypatch.setattr(llamacpp.requests, "post", unexpected)
+    assert "aborted" in llamacpp.execute_tool("http://h:1", 7.0, stop=lambda: True)("get_info", "{}")
+
+
+def test_a_tool_call_that_outlives_a_stop_gives_up_promptly(monkeypatch):
+    """The tool call outlives stop(): the simulated server never answers, the stop fires mid-call,
+    and the executor must return within seconds instead of the whole open timeout."""
+    stop = threading.Event()
+    block = threading.Event()
+
+    def blocking_post(*a, **k):
+        block.wait(30)  # a tool whose POST hangs forever
+        return Reply(body='{"os": "Darwin"}')
+
+    monkeypatch.setattr(llamacpp.requests, "post", blocking_post)
+    timer = threading.Timer(0.2, stop.set)
+    timer.start()
+    start = time.monotonic()
+    result = llamacpp.execute_tool("http://h:1", 120.0, stop=stop.is_set)("get_info", "{}")
+    elapsed = time.monotonic() - start
+    timer.cancel()
+    block.set()  # let the abandoned worker thread finish
+    assert elapsed < 5
+    assert "aborted" in result
+
+
+def test_a_tool_that_is_slow_but_alive_is_not_killed(monkeypatch):
+    """A tool whose answer takes longer than the poll interval but within the deadline completes
+    normally: cancellation polling must not destroy a healthy request."""
+
+    def slow_post(url, json=None, timeout=None):
+        time.sleep(1.2)
+        return Reply(body='{"os": "Darwin"}')
+
+    monkeypatch.setattr(llamacpp.requests, "post", slow_post)
+    result = llamacpp.execute_tool("http://h:1", 10.0, stop=lambda: False)("get_info", "{}")
+    assert result == '{"os": "Darwin"}'
+
+
+def test_a_tool_call_that_never_gets_an_answer_times_out(monkeypatch):
+    block = threading.Event()
+
+    def blocking_post(*a, **k):
+        block.wait(30)  # a tool whose POST hangs forever
+        return Reply(body='{"os": "Darwin"}')
+
+    monkeypatch.setattr(llamacpp.requests, "post", blocking_post)
+    start = time.monotonic()
+    result = llamacpp.execute_tool("http://h:1", 0.3)("get_info", "{}")  # no stop signal at all
+    elapsed = time.monotonic() - start
+    block.set()  # let the abandoned worker thread finish
+    assert elapsed < 5
+    assert "timed out" in result
+
+
 def test_fetch_tools_flattens_every_advertised_tool(monkeypatch):
     listing = [
         {"tool": "read_file", "definition": {"type": "function", "function": {
