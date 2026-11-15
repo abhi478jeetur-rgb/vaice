@@ -561,9 +561,9 @@ def _fake_stream_class(launched=None):
         class ui:  # a stand-in for the gradio app
 
             @staticmethod
-            def launch(server_port, pwa):
+            def launch(server_port, pwa, allowed_paths):
                 if launched is not None:
-                    launched.append((server_port, pwa))
+                    launched.append((server_port, pwa, allowed_paths))
 
     return FakeStream
 
@@ -667,3 +667,17 @@ def test_main_keeps_the_conversation_in_memory_when_vaice_data_dir_is_empty(monk
 
     assert "in memory only" in caplog.text
     assert not (tmp_path / "conversation.json").exists()
+
+
+def test_export_transcript_writes_the_markdown_under_the_data_dir(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    conversation = Conversation()
+    turn = conversation.start_turn()
+    turn.set_user_text("hello")
+    turn.set_assistant_text("hi there")
+    turn.finish()
+
+    path = app.export_transcript(conversation)
+
+    assert path == str(tmp_path / "exports" / "transcript.md")
+    assert (tmp_path / "exports" / "transcript.md").read_text(encoding="utf-8") == conversation.export_markdown()
